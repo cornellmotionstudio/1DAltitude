@@ -2,7 +2,10 @@ import time
 import curses
 import serial
 from collections import deque
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 from itertools import cycle
+import threading
 
 from yamspy import MSPy
 
@@ -10,9 +13,9 @@ DRONE_SERIAL = "COM7"
 ARDUINO_SERIAL = serial.Serial(port='COM3', baudrate=115200, timeout=0.02)
 
 # PID Tuning Variables
-kp = 0.03
-ki = 0.01
-kd = 0.02
+kp = 0.05
+ki = 0.03
+kd = 0.05
 previous_error = 0
 integral = 0
 dt = CTRL_LOOP_TIME = 0.025
@@ -112,11 +115,19 @@ def keyboard_controller(screen):
             cursor_msg = ""
             measured_altitude = 0.0
             last_loop_time = time.time()
+            init_time = time.time()
             while True:
                 start_time = time.time()
 
                 char = screen.getch() # get keypress
                 curses.flushinp() # flushes buffer
+
+                # Read measured altitude from Arduino
+                line = ARDUINO_SERIAL.readline()
+                try:
+                    measured_altitude = float(line.decode().strip())
+                except:
+                    continue
                 
 
                 #
@@ -182,16 +193,8 @@ def keyboard_controller(screen):
                         CMDS['pitch'] = CMDS['pitch'] - 10 if CMDS['pitch'] - 10 >= 1000 else CMDS['pitch']
                         cursor_msg = 'Down Key - pitch(-):{}'.format(CMDS['pitch'])
                 else:
-                    # Read measured altitude from Arduino
-                    line = ARDUINO_SERIAL.readline()
-                    try:
-                        measured_altitude = float(line.decode().strip())
-                    except:
-                        continue
-                
                     # Calculate PID control output
-                    control, error, integral = pid_controller(
-                        target_altitude, float(measured_altitude), kp, ki, kd, previous_error, integral, dt)
+                    control, error, integral = pid_controller(target_altitude, float(measured_altitude), kp, ki, kd, previous_error, integral, dt)
                     
                     # Update throttle based on PID control output
                     throttle = int(CMDS['throttle'] + control)
@@ -199,12 +202,11 @@ def keyboard_controller(screen):
                     CMDS['throttle'] = throttle
                     previous_error = error
 
-                screen.addstr(5, 0, f"[PID] Target Altitude: {target_altitude:.1f} mm       ")
-                screen.addstr(6, 0, f"[PID] kp: {kp:.3f}, ki: {ki:.3f}, kd: {kd:.3f}        ")
-                screen.clrtoeol()
-                screen.addstr(7, 0, f"[PID] Measured Altitude: {measured_altitude:.1f} mm       ")
-                screen.addstr(8, 0, f"[PID] Throttle: {CMDS['throttle']}       ")
-
+                    time_steps.append(time.time()-init_time)
+                    measured_values.append(measured_altitude)
+                    target_values.append(target_altitude)
+                    throttle_values.append(CMDS['throttle'])
+                    control_values.append(control)
                 #
                 # IMPORTANT MESSAGES (CTRL_LOOP_TIME based)
                 #
@@ -214,11 +216,15 @@ def keyboard_controller(screen):
                     if board.send_RAW_RC([CMDS[ki] for ki in CMDS_ORDER]):
                         dataHandler = board.receive_msg()
                         board.process_recv_data(dataHandler)
-                
-    
+
                 screen.addstr(2, 0, f"[MODE] Current Mode: {mode}        ", curses.A_BOLD)
                 screen.addstr(3, 0, cursor_msg)
                 screen.clrtoeol()
+                screen.addstr(5, 0, f"[PID] Target Altitude: {target_altitude:.1f} mm       ")
+                screen.addstr(6, 0, f"[PID] kp: {kp:.3f}, ki: {ki:.3f}, kd: {kd:.3f}        ")
+                screen.clrtoeol()
+                screen.addstr(7, 0, f"[PID] Measured Altitude: {measured_altitude:.1f} mm       ")
+                screen.addstr(8, 0, f"[PID] Throttle: {CMDS['throttle']}       ")
 
                     
                 end_time = time.time()
@@ -229,7 +235,28 @@ def keyboard_controller(screen):
         screen.addstr(5, 0, "Disconneced from the FC!")
         screen.clrtoeol()
 
+
 if __name__ == "__main__":
+
     run_curses(keyboard_controller)
 
+    # Now plot the data after curses exits
+    fig, ax1 = plt.subplots()
+    fig.suptitle("Real-Time Altitude PID Control")
 
+    ax1.set_xlabel("Time (s)")
+    ax1.set_ylabel("Altitude (mm)")
+    ax1.set_ylim(0, 320)
+    line_measured, = ax1.plot(time_steps, measured_values, label="Measured Altitude", linewidth=2)
+    line_target, = ax1.plot(time_steps, target_values, label="Target Altitude", linestyle='--')
+    ax1.legend(loc="upper left")
+    ax1.grid(True)
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel("Throttle / Control")
+    ax2.set_ylim(800, 1700)
+    ax2.plot(time_steps, throttle_values, label="Throttle", color='orange', alpha=0.6)
+    ax2.plot(time_steps, control_values, label="Control Output", color='green', alpha=0.6)
+    ax2.legend(loc="upper right")
+
+    plt.show()
