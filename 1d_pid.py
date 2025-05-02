@@ -1,19 +1,21 @@
-import serial 
 import time
+import curses
+import serial
+from collections import deque
+from itertools import cycle
 
 from yamspy import MSPy
 
-# Adjust port to your Arduino's port and drone serial port
-ARDUINO_SERIAL = serial.Serial(port='COM7', baudrate=115200, timeout=.1)
-DRONE_SERIAL = 'COM12'
+DRONE_SERIAL = "COM7"
+ARDUINO_SERIAL = serial.Serial(port='COM3', baudrate=115200, timeout=0.02)
 
 # PID Tuning Variables
-kp = 1.0
-ki = 0.1
-kd = 0.05
+kp = 0.03
+ki = 0.01
+kd = 0.02
 previous_error = 0
 integral = 0
-dt = 0.1
+dt = CTRL_LOOP_TIME = 0.025
 
 # Plotting Variables
 time_steps = []
@@ -22,7 +24,7 @@ control_values = []
 target_values = []
 measured_values = []
 
-target_altitude = 50.0 # Target in mm
+target_altitude = 100.0  # Target altitude in mm
 
 def pid_controller(target, measured, kp, ki, kd, previous_error, integral, dt):
     error = target - measured
@@ -31,80 +33,203 @@ def pid_controller(target, measured, kp, ki, kd, previous_error, integral, dt):
     control = kp * error + ki * integral + kd * derivative
     return control, error, integral
 
-def control_loop():
-    global previous_error, integral, dt
+def run_curses(external_function):
+    result=1
 
-    CMDS = {
-        'roll':     1500,
-        'pitch':    1500,
-        'throttle': 900,
-        'yaw':      1500,
-        'aux1':     1000,
-        'aux2':     1000
-        }
-    
-    # Assuming flight controller set to AETR
-    CMDS_ORDER = ['roll', 'pitch', 'throttle', 'yaw', 'aux1', 'aux2']
-    
-    with MSPy(device=DRONE_SERIAL, loglevel='WARNING', baudrate=115200) as board:
-        if board == 1: #error occured
-            print("Error connecting to drone, check serial port and connection.")
-            return 1
+    try:
+        # get the curses screen window
+        screen = curses.initscr()
+
+        # turn off input echoing
+        curses.noecho()
+
+        # respond to keys immediately (don't wait for enter)
+        curses.cbreak()
+
+        # non-blocking
+        screen.timeout(0)
+
+        # map arrow keys to special values
+        screen.keypad(True)
+
+        screen.addstr(1, 0, "Press 'q' to quit, 'r' to reboot, 'a' to arm, 'd' to disarm, 'm' to change mode (manual or PID) and arrow keys to control", curses.A_BOLD)
         
-        # Necessary to send some messages or RX failsage will be activated
-        command_list = ['MSP_API_VERSION', 'MSP_FC_VARIANT', 'MSP_FC_VERSION', 'MSP_BUILD_INFO', 
-                    'MSP_BOARD_INFO', 'MSP_UID', 'MSP_ACC_TRIM', 'MSP_NAME', 'MSP_STATUS', 'MSP_STATUS_EX',
-                    'MSP_BATTERY_CONFIG', 'MSP_BATTERY_STATE', 'MSP_BOXNAMES']
+        result = external_function(screen)
 
-        for msg in command_list: 
-            if board.send_RAW_msg(MSPy.MSPCodes[msg], data=[]):
-                dataHandler = board.receive_msg()
-                board.process_recv_data(dataHandler)
+    finally:
+        # shut down cleanly
+        curses.nocbreak(); screen.keypad(0); curses.echo()
+        curses.endwin()
+        if result==1:
+            print("An error occurred... probably the serial port is not available ;)")
 
-        print("flightControllerIdentifier: {}".format(board.CONFIG['flightControllerIdentifier']))
-        print("boardName: {}".format(board.CONFIG['boardName']))
-        print("name: {}".format(board.CONFIG['name']))
+def keyboard_controller(screen):
+    global target_altitude, kp, ki, kd, previous_error, integral, dt
+    CMDS = {
+            'roll':     1500,
+            'pitch':    1500,
+            'throttle': 900,
+            'yaw':      1500,
+            'aux1':     1000,
+            'aux2':     1500
+            }
 
-        CMDS['aux1'] = 1800 # Arm command
-        CMDS['aux2'] = 1500 # Enable Horizon Mode
+    # This order is the important bit: it will depend on how your flight controller is configured.
+    CMDS_ORDER = ['roll', 'pitch', 'throttle', 'yaw', 'aux1', 'aux2']
 
-        start_time = time.time()
-        try: 
-            while True:
-                # Send messages to board
-                if board.send_RAW_RC([CMDS[ki] for ki in CMDS_ORDER]):
+    # "print" doesn't work with curses, use addstr instead
+    try:
+        screen.addstr(15, 0, "Connecting to the FC...")
+
+        with MSPy(device=DRONE_SERIAL, loglevel='WARNING', baudrate=115200) as board:
+            if board == 1: # an error occurred...
+                return 1
+
+            screen.addstr(15, 0, "Connecting to the FC... connected!")
+            screen.clrtoeol()
+            screen.move(1,0)
+
+            # It's necessary to send some messages or the RX failsafe will be activated
+            # and it will not be possible to arm.
+            command_list = ['MSP_API_VERSION', 'MSP_FC_VARIANT', 'MSP_FC_VERSION', 'MSP_BUILD_INFO', 
+                            'MSP_BOARD_INFO', 'MSP_UID', 'MSP_ACC_TRIM', 'MSP_NAME', 'MSP_STATUS', 'MSP_STATUS_EX',
+                            'MSP_BATTERY_CONFIG', 'MSP_BATTERY_STATE', 'MSP_BOXNAMES']
+
+            for msg in command_list: 
+                if board.send_RAW_msg(MSPy.MSPCodes[msg], data=[]):
                     dataHandler = board.receive_msg()
                     board.process_recv_data(dataHandler)
 
-                # Read measured altitude from Arduino
-                measured_altitude = ARDUINO_SERIAL.readline().decode('utf-8').strip()
-                if measured_altitude: measured_altitude = float (measured_altitude)
-                else: 
-                    print("No altitude data received from Arduino.")
-                    continue
+            screen.addstr(15, 0, "apiVersion: {}".format(board.CONFIG['apiVersion']))
+            screen.clrtoeol()
+            screen.addstr(15, 50, "flightControllerIdentifier: {}".format(board.CONFIG['flightControllerIdentifier']))
+            screen.addstr(16, 0, "flightControllerVersion: {}".format(board.CONFIG['flightControllerVersion']))
+            screen.addstr(16, 50, "boardIdentifier: {}".format(board.CONFIG['boardIdentifier']))
+            screen.addstr(17, 0, "boardName: {}".format(board.CONFIG['boardName']))
+            screen.addstr(17, 50, "name: {}".format(board.CONFIG['name']))
 
-                # Calculate PID control output
-                control, error, integral = pid_controller(
-                    target_altitude, float(measured_altitude), kp, ki, kd, previous_error, integral, dt)
+            mode = 'MANUAL'
+            cursor_msg = ""
+            measured_altitude = 0.0
+            last_loop_time = time.time()
+            while True:
+                start_time = time.time()
+
+                char = screen.getch() # get keypress
+                curses.flushinp() # flushes buffer
                 
-                # Update throttle based on PID control output
-                throttle = int(CMDS['throttle'] + control)
-                throttle = max(900, min(throttle, 2000))
-                previous_error = error
 
-                # Plot data
-                time_steps.append(time.time() - start_time)
-                throttle_values.append(throttle)
-                control_values.append(control)
-                target_values.append(target_altitude)
-                measured_values.append(measured_altitude)
+                #
+                # Key input processing
+                #
 
-                time.sleep(dt)
-        except KeyboardInterrupt:
-            print("Exiting control loop")
-            CMDS['aux1'] = 1000 # Disarm command
-            board.send_RAW_RC([CMDS[ki] for ki in CMDS_ORDER])  
-            
+                #
+                # KEYS (NO DELAYS)
+                #
+                if char == ord('q') or char == ord('Q'):
+                    break
+
+                elif char == ord('d') or char == ord('D'):
+                    cursor_msg = 'Sending Disarm command...'
+                    CMDS['aux1'] = 1000
+
+                elif char == ord('r') or char == ord('R'):
+                    screen.addstr(3, 0, 'Sending Reboot command...')
+                    screen.clrtoeol()
+                    board.reboot()
+                    time.sleep(0.5)
+                    break
+
+                elif char == ord('a') or char == ord('A'):
+                    cursor_msg = 'Sending Arm command...'
+                    CMDS['aux1'] = 1800
+
+                elif char == ord('m') or char == ord('M'):
+                    if mode == 'MANUAL':
+                        mode = 'PID'
+                        cursor_msg = 'Mode changed to PID!'
+                    else:
+                        mode = 'MANUAL'
+                        cursor_msg = 'Mode changed to MANUAL!'
+
+
+                #
+                # The code below is expecting the drone to have the
+                # modes set accordingly since everything is hardcoded.
+                #
+                if mode == 'MANUAL':
+                    if char == ord('w') or char == ord('W'):
+                        CMDS['throttle'] = CMDS['throttle'] + 10 if CMDS['throttle'] + 10 <= 2000 else CMDS['throttle']
+                        cursor_msg = 'W Key - throttle(+):{}'.format(CMDS['throttle'])
+
+                    elif char == ord('e') or char == ord('E'):
+                        CMDS['throttle'] = CMDS['throttle'] - 10 if CMDS['throttle'] - 10 >= 1000 else CMDS['throttle']
+                        cursor_msg = 'E Key - throttle(-):{}'.format(CMDS['throttle'])
+
+                    elif char == curses.KEY_RIGHT:
+                        CMDS['roll'] = CMDS['roll'] + 10 if CMDS['roll'] + 10 <= 2000 else CMDS['roll']
+                        cursor_msg = 'Right Key - roll(-):{}'.format(CMDS['roll'])
+
+                    elif char == curses.KEY_LEFT:
+                        CMDS['roll'] = CMDS['roll'] - 10 if CMDS['roll'] - 10 >= 1000 else CMDS['roll']
+                        cursor_msg = 'Left Key - roll(+):{}'.format(CMDS['roll'])
+
+                    elif char == curses.KEY_UP:
+                        CMDS['pitch'] = CMDS['pitch'] + 10 if CMDS['pitch'] + 10 <= 2000 else CMDS['pitch']
+                        cursor_msg = 'Up Key - pitch(+):{}'.format(CMDS['pitch'])
+
+                    elif char == curses.KEY_DOWN:
+                        CMDS['pitch'] = CMDS['pitch'] - 10 if CMDS['pitch'] - 10 >= 1000 else CMDS['pitch']
+                        cursor_msg = 'Down Key - pitch(-):{}'.format(CMDS['pitch'])
+                else:
+                    # Read measured altitude from Arduino
+                    line = ARDUINO_SERIAL.readline()
+                    try:
+                        measured_altitude = float(line.decode().strip())
+                    except:
+                        continue
+                
+                    # Calculate PID control output
+                    control, error, integral = pid_controller(
+                        target_altitude, float(measured_altitude), kp, ki, kd, previous_error, integral, dt)
+                    
+                    # Update throttle based on PID control output
+                    throttle = int(CMDS['throttle'] + control)
+                    throttle = max(900, min(throttle, 1500))
+                    CMDS['throttle'] = throttle
+                    previous_error = error
+
+                screen.addstr(5, 0, f"[PID] Target Altitude: {target_altitude:.1f} mm       ")
+                screen.addstr(6, 0, f"[PID] kp: {kp:.3f}, ki: {ki:.3f}, kd: {kd:.3f}        ")
+                screen.clrtoeol()
+                screen.addstr(7, 0, f"[PID] Measured Altitude: {measured_altitude:.1f} mm       ")
+                screen.addstr(8, 0, f"[PID] Throttle: {CMDS['throttle']}       ")
+
+                #
+                # IMPORTANT MESSAGES (CTRL_LOOP_TIME based)
+                #
+                if (time.time()-last_loop_time) >= CTRL_LOOP_TIME:
+                    last_loop_time = time.time()
+                    # Send the RC channel values to the FC
+                    if board.send_RAW_RC([CMDS[ki] for ki in CMDS_ORDER]):
+                        dataHandler = board.receive_msg()
+                        board.process_recv_data(dataHandler)
+                
+    
+                screen.addstr(2, 0, f"[MODE] Current Mode: {mode}        ", curses.A_BOLD)
+                screen.addstr(3, 0, cursor_msg)
+                screen.clrtoeol()
+
+                    
+                end_time = time.time()
+                if (end_time-start_time)<CTRL_LOOP_TIME:
+                    time.sleep(CTRL_LOOP_TIME-(end_time-start_time))
+
+    finally:
+        screen.addstr(5, 0, "Disconneced from the FC!")
+        screen.clrtoeol()
 
 if __name__ == "__main__":
-    control_loop()
+    run_curses(keyboard_controller)
+
+
