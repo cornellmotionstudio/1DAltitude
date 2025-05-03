@@ -13,12 +13,14 @@ DRONE_SERIAL = "COM7"
 ARDUINO_SERIAL = serial.Serial(port='COM3', baudrate=115200, timeout=0.02)
 
 # PID Tuning Variables
-kp = 0.05
-ki = 0.03
-kd = 0.05
+kp = 1.0
+ki = 0.01
+kd = 0.3
+
 previous_error = 0
 integral = 0
-dt = CTRL_LOOP_TIME = 0.025
+MAX_INTEGRAL = 100
+dt = CTRL_LOOP_TIME = 0.02
 
 # Plotting Variables
 time_steps = []
@@ -28,10 +30,12 @@ target_values = []
 measured_values = []
 
 target_altitude = 100.0  # Target altitude in mm
+previous_target = 0
 
 def pid_controller(target, measured, kp, ki, kd, previous_error, integral, dt):
     error = target - measured
     integral += error * dt
+    integral = max(min(integral, MAX_INTEGRAL), -MAX_INTEGRAL)
     derivative = (error - previous_error) / dt
     control = kp * error + ki * integral + kd * derivative
     return control, error, integral
@@ -55,7 +59,7 @@ def run_curses(external_function):
         # map arrow keys to special values
         screen.keypad(True)
 
-        screen.addstr(1, 0, "Press 'q' to quit, 'r' to reboot, 'a' to arm, 'd' to disarm, 'm' to change mode (manual or PID) and arrow keys to control", curses.A_BOLD)
+        screen.addstr(1, 0, "Press 'q' to quit, 'r' to reboot, 'a' to arm, 'd' to disarm, 't' to change target, 'm' to change mode (manual or PID) and arrow keys + 'w'/'e' to control", curses.A_BOLD)
         
         result = external_function(screen)
 
@@ -67,14 +71,14 @@ def run_curses(external_function):
             print("An error occurred... probably the serial port is not available ;)")
 
 def keyboard_controller(screen):
-    global target_altitude, kp, ki, kd, previous_error, integral, dt
+    global target_altitude, previous_target, kp, ki, kd, previous_error, integral
     CMDS = {
             'roll':     1500,
             'pitch':    1500,
             'throttle': 900,
             'yaw':      1500,
             'aux1':     1000,
-            'aux2':     1500
+            'aux2':     1500 # Horizon mode
             }
 
     # This order is the important bit: it will depend on how your flight controller is configured.
@@ -162,12 +166,23 @@ def keyboard_controller(screen):
                     else:
                         mode = 'MANUAL'
                         cursor_msg = 'Mode changed to MANUAL!'
+                elif char == ord('t') or char == ord('T'):
+                    curses.echo()
+                    screen.addstr(10, 0, "Enter new target altitude (mm): ")
+                    screen.clrtoeol()
+                    screen.refresh()
+                    try:
+                        input_str = screen.getstr(10, 34, 10).decode().strip()
+                        new_target = float(input_str)
+                        target_altitude = new_target
+                        cursor_msg = f"Target altitude updated to: {target_altitude} mm"
+                    except:
+                        cursor_msg = "Invalid input for target altitude"
+                    screen.move(10, 0)
+                    screen.clrtoeol()
+                    curses.noecho()
 
 
-                #
-                # The code below is expecting the drone to have the
-                # modes set accordingly since everything is hardcoded.
-                #
                 if mode == 'MANUAL':
                     if char == ord('w') or char == ord('W'):
                         CMDS['throttle'] = CMDS['throttle'] + 10 if CMDS['throttle'] + 10 <= 2000 else CMDS['throttle']
@@ -194,11 +209,15 @@ def keyboard_controller(screen):
                         cursor_msg = 'Down Key - pitch(-):{}'.format(CMDS['pitch'])
                 else:
                     # Calculate PID control output
+                    if abs(target_altitude - previous_target) > 5:
+                        integral = 0
+                    previous_target = target_altitude
                     control, error, integral = pid_controller(target_altitude, float(measured_altitude), kp, ki, kd, previous_error, integral, dt)
                     
                     # Update throttle based on PID control output
-                    throttle = int(CMDS['throttle'] + control)
-                    throttle = max(900, min(throttle, 1500))
+                    base_throttle = 1350  # Base throttle value
+                    throttle = int(base_throttle + control)
+                    throttle = max(900, min(throttle, 1600))
                     CMDS['throttle'] = throttle
                     previous_error = error
 
@@ -242,8 +261,8 @@ if __name__ == "__main__":
 
     # Now plot the data after curses exits
     fig, ax1 = plt.subplots()
-    fig.suptitle("Real-Time Altitude PID Control")
-
+    fig.suptitle("Real-Time Altitude PID Control [kp={}, ki={}, kd={}]".format(kp, ki, kd))
+    
     ax1.set_xlabel("Time (s)")
     ax1.set_ylabel("Altitude (mm)")
     ax1.set_ylim(0, 320)
@@ -256,7 +275,6 @@ if __name__ == "__main__":
     ax2.set_ylabel("Throttle / Control")
     ax2.set_ylim(800, 1700)
     ax2.plot(time_steps, throttle_values, label="Throttle", color='orange', alpha=0.6)
-    ax2.plot(time_steps, control_values, label="Control Output", color='green', alpha=0.6)
     ax2.legend(loc="upper right")
 
     plt.show()
